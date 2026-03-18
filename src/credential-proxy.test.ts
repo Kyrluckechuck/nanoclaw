@@ -11,6 +11,11 @@ vi.mock('./logger.js', () => ({
   logger: { info: vi.fn(), error: vi.fn(), debug: vi.fn(), warn: vi.fn() },
 }));
 
+vi.mock('./oauth-token.js', () => ({
+  getFreshOAuthToken: vi.fn(async () => null),
+  hasOAuthCredentials: vi.fn(() => false),
+}));
+
 import { startCredentialProxy } from './credential-proxy.js';
 
 function makeRequest(
