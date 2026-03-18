@@ -16,6 +16,7 @@ import { request as httpRequest, RequestOptions } from 'http';
 
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+import { getFreshOAuthToken, hasOAuthCredentials } from './oauth-token.js';
 
 export type AuthMode = 'api-key' | 'oauth';
 
@@ -35,8 +36,16 @@ export function startCredentialProxy(
   ]);
 
   const authMode: AuthMode = secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
-  const oauthToken =
+  // Static fallback for OAuth token (from .env)
+  const staticOauthToken =
     secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.ANTHROPIC_AUTH_TOKEN;
+  // Prefer credentials file (browser login) over .env (setup-token)
+  const useDynamicOAuth = !secrets.ANTHROPIC_API_KEY && hasOAuthCredentials();
+  if (useDynamicOAuth) {
+    logger.info(
+      'Using OAuth credentials from ~/.claude/.credentials.json (auto-refresh enabled)',
+    );
+  }
 
   const upstreamUrl = new URL(
     secrets.ANTHROPIC_BASE_URL || 'https://api.anthropic.com',
@@ -48,7 +57,7 @@ export function startCredentialProxy(
     const server = createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on('data', (c) => chunks.push(c));
-      req.on('end', () => {
+      req.on('end', async () => {
         const body = Buffer.concat(chunks);
         const headers: Record<string, string | number | string[] | undefined> =
           {
@@ -73,8 +82,11 @@ export function startCredentialProxy(
           // x-api-key only, so they pass through without token injection.
           if (headers['authorization']) {
             delete headers['authorization'];
-            if (oauthToken) {
-              headers['authorization'] = `Bearer ${oauthToken}`;
+            const token = useDynamicOAuth
+              ? await getFreshOAuthToken()
+              : staticOauthToken;
+            if (token) {
+              headers['authorization'] = `Bearer ${token}`;
             }
           }
         }

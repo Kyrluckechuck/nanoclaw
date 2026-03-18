@@ -4,6 +4,7 @@
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -19,13 +20,15 @@ import {
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
-  CONTAINER_HOST_GATEWAY,
+  containerHostGateway,
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
+  isDockerRootless,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { getFreshOAuthToken, hasOAuthCredentials } from './oauth-token.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -157,6 +160,20 @@ function buildVolumeMounts(
       fs.cpSync(srcDir, dstDir, { recursive: true });
     }
   }
+
+  // Copy OAuth credentials into the group's .claude/ so the CLI can
+  // authenticate directly (browser-login flow, no create_api_key exchange).
+  // Refreshed on each container spawn to keep the token fresh.
+  const hostCredsPath = path.join(
+    process.env.HOME || os.homedir(),
+    '.claude',
+    '.credentials.json',
+  );
+  if (fs.existsSync(hostCredsPath)) {
+    const groupCredsPath = path.join(groupSessionsDir, '.credentials.json');
+    fs.cpSync(hostCredsPath, groupCredsPath);
+  }
+
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
@@ -221,21 +238,25 @@ function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Route API traffic through the credential proxy (containers never see real secrets)
-  args.push(
-    '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
-  );
+  // When .credentials.json is available (browser login), the CLI authenticates
+  // directly — no proxy needed for auth. Otherwise, route through the proxy.
+  const useDirectAuth = hasOAuthCredentials();
+  if (!useDirectAuth) {
+    args.push(
+      '-e',
+      `ANTHROPIC_BASE_URL=http://${containerHostGateway()}:${CREDENTIAL_PROXY_PORT}`,
+    );
 
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
-  const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
-  } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    // Mirror the host's auth method with a placeholder value.
+    // API key mode: SDK sends x-api-key, proxy replaces with real key.
+    // OAuth mode:   SDK exchanges placeholder token for temp API key,
+    //               proxy injects real OAuth token on that exchange request.
+    const authMode = detectAuthMode();
+    if (authMode === 'api-key') {
+      args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+    } else {
+      args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    }
   }
 
   // Runtime-specific args for host gateway resolution
@@ -246,7 +267,13 @@ function buildContainerArgs(
   // or when getuid is unavailable (native Windows without WSL).
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
-  if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
+  if (isDockerRootless()) {
+    // Rootless Docker remaps UIDs via user namespaces, making host files
+    // appear root-owned inside the container. Run as root inside the
+    // container so bind-mounted files are accessible.
+    args.push('--user', 'root');
+    args.push('-e', 'HOME=/home/node');
+  } else if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
     args.push('--user', `${hostUid}:${hostGid}`);
     args.push('-e', 'HOME=/home/node');
   }
@@ -271,6 +298,12 @@ export async function runContainerAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
+
+  // Ensure OAuth credentials are fresh before building mounts
+  // (buildVolumeMounts copies .credentials.json into the container's .claude/)
+  if (hasOAuthCredentials()) {
+    await getFreshOAuthToken();
+  }
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
