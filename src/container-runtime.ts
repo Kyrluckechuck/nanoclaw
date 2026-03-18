@@ -8,18 +8,11 @@ import os from 'os';
 
 import { logger } from './logger.js';
 
-/** Cached result of rootless detection (null = not yet checked). */
-let _isRootless: boolean | null = null;
-
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
 /** Hostname containers use to reach the host machine. */
-export function containerHostGateway(): string {
-  // Docker rootless with --network host: container shares daemon's network namespace
-  if (os.platform() === 'linux' && isDockerRootless()) return 'localhost';
-  return 'host.docker.internal';
-}
+export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
 
 /**
  * Address the credential proxy binds to.
@@ -37,9 +30,6 @@ function detectProxyBindHost(): string {
   // Check /proc filesystem, not env vars — WSL_DISTRO_NAME isn't set under systemd.
   if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
 
-  // Docker rootless with --network host: containers use localhost directly
-  if (isDockerRootless()) return '127.0.0.1';
-
   // Bare-metal Linux: bind to the docker0 bridge IP instead of 0.0.0.0
   const ifaces = os.networkInterfaces();
   const docker0 = ifaces['docker0'];
@@ -50,34 +40,13 @@ function detectProxyBindHost(): string {
   return '0.0.0.0';
 }
 
-/** Detect if Docker is running in rootless mode. */
-export function isDockerRootless(): boolean {
-  if (_isRootless !== null) return _isRootless;
-  try {
-    const info = execSync('docker info --format "{{.SecurityOptions}}"', {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-      timeout: 5000,
-    });
-    _isRootless = info.includes('rootless');
-  } catch {
-    _isRootless = false;
-  }
-  return _isRootless;
-}
-
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
-  if (os.platform() !== 'linux') return [];
-
-  // Docker rootless: container bridge network can't reach host ports.
-  // Use --network host so the container shares the daemon's network namespace.
-  if (isDockerRootless()) {
-    return ['--network', 'host'];
+  // On Linux, host.docker.internal isn't built-in — add it explicitly
+  if (os.platform() === 'linux') {
+    return ['--add-host=host.docker.internal:host-gateway'];
   }
-
-  // Standard Docker: add host.docker.internal explicitly (not built-in on Linux)
-  return ['--add-host=host.docker.internal:host-gateway'];
+  return [];
 }
 
 /** Returns CLI args for a readonly bind mount. */

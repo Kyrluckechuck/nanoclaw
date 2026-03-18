@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, execSync, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -20,10 +20,9 @@ import {
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
-  containerHostGateway,
+  CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
-  isDockerRootless,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
@@ -172,6 +171,52 @@ function buildVolumeMounts(
   if (fs.existsSync(hostCredsPath)) {
     const groupCredsPath = path.join(groupSessionsDir, '.credentials.json');
     fs.cpSync(hostCredsPath, groupCredsPath);
+    // Ensure readable inside rootless Docker (UID remapping makes files
+    // appear root-owned; the container's node user needs read access)
+    fs.chmodSync(groupCredsPath, 0o644);
+  }
+
+  // Set up git credentials for container (HTTPS-based, using gh token)
+  // This allows the agent to clone, push, and create PRs
+  try {
+    const ghToken = execSync('gh auth token', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 5000,
+    }).trim();
+    if (ghToken) {
+      const gitUser = execSync('git config --global user.name', {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).trim();
+      const gitEmail = execSync('git config --global user.email', {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).trim();
+
+      const gitconfigPath = path.join(groupSessionsDir, '.gitconfig');
+      fs.writeFileSync(
+        gitconfigPath,
+        [
+          `[user]`,
+          `  name = ${gitUser || 'NanoClaw Bot'}`,
+          `  email = ${gitEmail || 'bot@nanoclaw'}`,
+          `[credential]`,
+          `  helper = store --file /home/node/.claude/.git-credentials`,
+          '',
+        ].join('\n'),
+      );
+      fs.chmodSync(gitconfigPath, 0o644);
+
+      const gitCredsPath = path.join(groupSessionsDir, '.git-credentials');
+      fs.writeFileSync(
+        gitCredsPath,
+        `https://x-access-token:${ghToken}@github.com\n`,
+      );
+      fs.chmodSync(gitCredsPath, 0o644);
+    }
+  } catch {
+    // gh not installed or not authenticated — git push won't work but that's ok
   }
 
   mounts.push({
@@ -238,13 +283,16 @@ function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // Point git to the config inside .claude/ (mounted at /home/node/.claude)
+  args.push('-e', 'GIT_CONFIG_GLOBAL=/home/node/.claude/.gitconfig');
+
   // When .credentials.json is available (browser login), the CLI authenticates
   // directly — no proxy needed for auth. Otherwise, route through the proxy.
   const useDirectAuth = hasOAuthCredentials();
   if (!useDirectAuth) {
     args.push(
       '-e',
-      `ANTHROPIC_BASE_URL=http://${containerHostGateway()}:${CREDENTIAL_PROXY_PORT}`,
+      `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
     );
 
     // Mirror the host's auth method with a placeholder value.
@@ -267,13 +315,7 @@ function buildContainerArgs(
   // or when getuid is unavailable (native Windows without WSL).
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
-  if (isDockerRootless()) {
-    // Rootless Docker remaps UIDs via user namespaces, making host files
-    // appear root-owned inside the container. Run as root inside the
-    // container so bind-mounted files are accessible.
-    args.push('--user', 'root');
-    args.push('-e', 'HOME=/home/node');
-  } else if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
+  if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
     args.push('--user', `${hostUid}:${hostGid}`);
     args.push('-e', 'HOME=/home/node');
   }
