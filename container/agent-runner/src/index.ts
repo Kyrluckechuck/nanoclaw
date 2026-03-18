@@ -365,88 +365,109 @@ async function main(): Promise<void> {
     let hadError = false;
     let resultEmitted = false;
 
-    try {
-      for await (const message of query({
-        prompt: trimmedPrompt,
-        options: {
-          cwd: '/workspace/group',
-          resume: sessionId,
-          systemPrompt: undefined,
-          allowedTools: [],
-          env: sdkEnv,
-          permissionMode: 'bypassPermissions' as const,
-          allowDangerouslySkipPermissions: true,
-          settingSources: ['project', 'user'] as const,
-          hooks: {
-            PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
-          },
-        },
-      })) {
-        const msgType = message.type === 'system'
-          ? `system/${(message as { subtype?: string }).subtype}`
-          : message.type;
-        log(`[slash-cmd] type=${msgType}`);
-
-        if (message.type === 'system' && message.subtype === 'init') {
-          slashSessionId = message.session_id;
-          log(`Session after slash command: ${slashSessionId}`);
-        }
-
-        // Observe compact_boundary to confirm compaction completed
-        if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
-          compactBoundarySeen = true;
-          log('Compact boundary observed — compaction completed');
-        }
-
-        if (message.type === 'result') {
-          const resultSubtype = (message as { subtype?: string }).subtype;
-          const textResult = 'result' in message ? (message as { result?: string }).result : null;
-
-          if (resultSubtype?.startsWith('error')) {
-            hadError = true;
-            writeOutput({
-              status: 'error',
-              result: null,
-              error: textResult || 'Session command failed.',
-              newSessionId: slashSessionId,
-            });
-          } else {
-            writeOutput({
-              status: 'success',
-              result: textResult || 'Conversation compacted.',
-              newSessionId: slashSessionId,
-            });
-          }
-          resultEmitted = true;
-        }
-      }
-    } catch (err) {
-      hadError = true;
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      log(`Slash command error: ${errorMsg}`);
-      writeOutput({ status: 'error', result: null, error: errorMsg });
+    // Spawn CLI for the slash command (one-shot, no follow-up messages)
+    const slashArgs: string[] = [
+      '-p',
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--dangerously-skip-permissions',
+    ];
+    if (sessionId) {
+      slashArgs.push('--resume', sessionId);
     }
 
-    log(`Slash command done. compactBoundarySeen=${compactBoundarySeen}, hadError=${hadError}`);
+    const slashClaude = spawn('claude', slashArgs, {
+      cwd: '/workspace/group',
+      env: { ...process.env },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
 
-    // Warn if compact_boundary was never observed — compaction may not have occurred
-    if (!hadError && !compactBoundarySeen) {
-      log('WARNING: compact_boundary was not observed. Compaction may not have completed.');
-    }
+    // Send the slash command and close stdin (one-shot)
+    sendUserMessage(slashClaude, trimmedPrompt);
+    slashClaude.stdin?.end();
 
-    // Only emit final session marker if no result was emitted yet and no error occurred
-    if (!resultEmitted && !hadError) {
-      writeOutput({
-        status: 'success',
-        result: compactBoundarySeen
-          ? 'Conversation compacted.'
-          : 'Compaction requested but compact_boundary was not observed.',
-        newSessionId: slashSessionId,
+    await new Promise<void>((resolve) => {
+      let buffer = '';
+      slashClaude.stdout.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString();
+        let newlineIdx: number;
+        while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newlineIdx).trim();
+          buffer = buffer.slice(newlineIdx + 1);
+          if (!line) continue;
+          try {
+            const message = JSON.parse(line);
+            const msgType = message.type === 'system'
+              ? `system/${message.subtype}`
+              : message.type;
+            log(`[slash-cmd] type=${msgType}`);
+
+            if (message.type === 'system' && message.subtype === 'init') {
+              slashSessionId = message.session_id;
+              log(`Session after slash command: ${slashSessionId}`);
+            }
+
+            if (message.type === 'system' && message.subtype === 'compact_boundary') {
+              compactBoundarySeen = true;
+              log('Compact boundary observed — compaction completed');
+            }
+
+            if (message.type === 'result') {
+              const textResult = message.result || null;
+              if (message.subtype?.startsWith('error')) {
+                hadError = true;
+                writeOutput({
+                  status: 'error',
+                  result: null,
+                  error: textResult || 'Session command failed.',
+                  newSessionId: slashSessionId,
+                });
+              } else {
+                writeOutput({
+                  status: 'success',
+                  result: textResult || 'Conversation compacted.',
+                  newSessionId: slashSessionId,
+                });
+              }
+              resultEmitted = true;
+            }
+          } catch { /* skip non-JSON */ }
+        }
       });
-    } else if (!hadError) {
-      // Emit session-only marker so host updates session tracking
-      writeOutput({ status: 'success', result: null, newSessionId: slashSessionId });
-    }
+
+      slashClaude.stderr.on('data', (chunk: Buffer) => {
+        const lines = chunk.toString().trim().split('\n');
+        for (const line of lines) {
+          if (line) log(`[slash-cmd stderr] ${line}`);
+        }
+      });
+
+      slashClaude.on('close', (code) => {
+        log(`Slash command CLI exited (code: ${code}, compactBoundarySeen=${compactBoundarySeen}, hadError=${hadError})`);
+
+        if (code !== 0 && !resultEmitted) {
+          hadError = true;
+          writeOutput({ status: 'error', result: null, error: `Slash command exited with code ${code}` });
+        }
+
+        if (!hadError && !compactBoundarySeen) {
+          log('WARNING: compact_boundary was not observed. Compaction may not have completed.');
+        }
+
+        if (!resultEmitted && !hadError) {
+          writeOutput({
+            status: 'success',
+            result: compactBoundarySeen
+              ? 'Conversation compacted.'
+              : 'Compaction requested but compact_boundary was not observed.',
+            newSessionId: slashSessionId,
+          });
+        } else if (!hadError) {
+          writeOutput({ status: 'success', result: null, newSessionId: slashSessionId });
+        }
+        resolve();
+      });
+    });
     return;
   }
   // --- End slash command handling ---
