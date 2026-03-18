@@ -365,9 +365,11 @@ async function main(): Promise<void> {
     let hadError = false;
     let resultEmitted = false;
 
-    // Spawn CLI for the slash command (one-shot, no follow-up messages)
+    // Spawn CLI with the slash command as the -p argument directly.
+    // Slash commands must be passed as -p value, NOT via stream-json stdin,
+    // otherwise the CLI treats them as literal user text.
     const slashArgs: string[] = [
-      '-p',
+      '-p', trimmedPrompt,
       '--output-format', 'stream-json',
       '--verbose',
       '--dangerously-skip-permissions',
@@ -382,8 +384,7 @@ async function main(): Promise<void> {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    // Send the slash command and close stdin (one-shot)
-    sendUserMessage(slashClaude, trimmedPrompt);
+    // Close stdin immediately (one-shot, no follow-up messages)
     slashClaude.stdin?.end();
 
     await new Promise<void>((resolve) => {
