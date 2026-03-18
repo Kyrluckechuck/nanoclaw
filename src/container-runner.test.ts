@@ -51,6 +51,18 @@ vi.mock('./mount-security.js', () => ({
   validateAdditionalMounts: vi.fn(() => []),
 }));
 
+// Mock oauth-token with controllable return value
+let mockHasOAuthCredentials = false;
+vi.mock('./oauth-token.js', () => ({
+  getFreshOAuthToken: vi.fn(async () => 'fresh-token'),
+  hasOAuthCredentials: vi.fn(() => mockHasOAuthCredentials),
+}));
+
+// Mock credential-proxy
+vi.mock('./credential-proxy.js', () => ({
+  detectAuthMode: vi.fn(() => 'oauth'),
+}));
+
 // Create a controllable fake ChildProcess
 function createFakeProcess() {
   const proc = new EventEmitter() as EventEmitter & {
@@ -112,9 +124,12 @@ function emitOutputMarker(
 }
 
 describe('container-runner timeout behavior', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.useFakeTimers();
     fakeProc = createFakeProcess();
+    mockHasOAuthCredentials = false;
+    const { spawn } = await import('child_process');
+    (spawn as ReturnType<typeof vi.fn>).mockClear();
   });
 
   afterEach(() => {
@@ -178,6 +193,79 @@ describe('container-runner timeout behavior', () => {
     expect(result.status).toBe('error');
     expect(result.error).toContain('timed out');
     expect(onOutput).not.toHaveBeenCalled();
+  });
+
+  it('refreshes OAuth token before spawning when credentials exist', async () => {
+    mockHasOAuthCredentials = true;
+    const { getFreshOAuthToken } = await import('./oauth-token.js');
+
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(getFreshOAuthToken).toHaveBeenCalled();
+
+    emitOutputMarker(fakeProc, { status: 'success', result: 'Done', newSessionId: 'session-oauth' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('success');
+    mockHasOAuthCredentials = false;
+  });
+
+  it('skips proxy env vars when using direct OAuth auth', async () => {
+    mockHasOAuthCredentials = true;
+    const { spawn } = await import('child_process');
+
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+    await vi.advanceTimersByTimeAsync(10);
+
+    const spawnCall = (spawn as ReturnType<typeof vi.fn>).mock.calls[0];
+    const args: string[] = spawnCall[1];
+    expect(args.some((a: string) => a.includes('ANTHROPIC_BASE_URL'))).toBe(false);
+
+    emitOutputMarker(fakeProc, { status: 'success', result: null });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
+    mockHasOAuthCredentials = false;
+  });
+
+  it('includes proxy env vars when no OAuth credentials', async () => {
+    mockHasOAuthCredentials = false;
+    const { spawn } = await import('child_process');
+
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+    await vi.advanceTimersByTimeAsync(10);
+
+    const spawnCall = (spawn as ReturnType<typeof vi.fn>).mock.calls[0];
+    const args: string[] = spawnCall[1];
+    expect(args.some((a: string) => a.includes('ANTHROPIC_BASE_URL'))).toBe(true);
+
+    emitOutputMarker(fakeProc, { status: 'success', result: null });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
+  });
+
+  it('includes GIT_CONFIG_GLOBAL env var', async () => {
+    const { spawn } = await import('child_process');
+
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+    await vi.advanceTimersByTimeAsync(10);
+
+    const spawnCall = (spawn as ReturnType<typeof vi.fn>).mock.calls[0];
+    const args: string[] = spawnCall[1];
+    expect(args.some((a: string) => a.includes('GIT_CONFIG_GLOBAL'))).toBe(true);
+
+    emitOutputMarker(fakeProc, { status: 'success', result: null });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
   });
 
   it('normal exit after output resolves as success', async () => {

@@ -12,11 +12,12 @@ vi.mock('./logger.js', () => ({
 }));
 
 vi.mock('./oauth-token.js', () => ({
-  getFreshOAuthToken: vi.fn(async () => null),
+  getFreshOAuthToken: vi.fn(async () => null as string | null),
   hasOAuthCredentials: vi.fn(() => false),
 }));
 
 import { startCredentialProxy } from './credential-proxy.js';
+import { getFreshOAuthToken, hasOAuthCredentials } from './oauth-token.js';
 
 function makeRequest(
   port: number,
@@ -73,6 +74,8 @@ describe('credential-proxy', () => {
     await new Promise<void>((r) => proxyServer?.close(() => r()));
     await new Promise<void>((r) => upstreamServer?.close(() => r()));
     for (const key of Object.keys(mockEnv)) delete mockEnv[key];
+    vi.mocked(hasOAuthCredentials).mockReturnValue(false);
+    vi.mocked(getFreshOAuthToken).mockResolvedValue(null);
   });
 
   async function startProxy(env: Record<string, string>): Promise<number> {
@@ -193,5 +196,59 @@ describe('credential-proxy', () => {
 
     expect(res.statusCode).toBe(502);
     expect(res.body).toBe('Bad Gateway');
+  });
+
+  it('dynamic OAuth uses getFreshOAuthToken when credentials file exists', async () => {
+    vi.mocked(hasOAuthCredentials).mockReturnValue(true);
+    vi.mocked(getFreshOAuthToken).mockResolvedValue('dynamic-fresh-token');
+
+    proxyPort = await startProxy({
+      CLAUDE_CODE_OAUTH_TOKEN: 'static-token-ignored',
+    });
+
+    await makeRequest(
+      proxyPort,
+      {
+        method: 'POST',
+        path: '/api/oauth/claude_cli/create_api_key',
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer placeholder',
+        },
+      },
+      '{}',
+    );
+
+    expect(lastUpstreamHeaders['authorization']).toBe(
+      'Bearer dynamic-fresh-token',
+    );
+    expect(getFreshOAuthToken).toHaveBeenCalled();
+  });
+
+  it('falls back to static token when no credentials file', async () => {
+    vi.mocked(hasOAuthCredentials).mockReturnValue(false);
+    vi.mocked(getFreshOAuthToken).mockClear();
+
+    proxyPort = await startProxy({
+      CLAUDE_CODE_OAUTH_TOKEN: 'static-fallback-token',
+    });
+
+    await makeRequest(
+      proxyPort,
+      {
+        method: 'POST',
+        path: '/api/oauth/claude_cli/create_api_key',
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer placeholder',
+        },
+      },
+      '{}',
+    );
+
+    expect(lastUpstreamHeaders['authorization']).toBe(
+      'Bearer static-fallback-token',
+    );
+    expect(getFreshOAuthToken).not.toHaveBeenCalled();
   });
 });
